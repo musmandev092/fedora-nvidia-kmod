@@ -1,0 +1,79 @@
+name: build-nvidia-kmod
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if release already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-nvidia-kmod
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Query latest Fedora 45 kernel
+        id: query
+        run: |
+          docker run --rm fedora:45 bash -c '
+            dnf repoquery --latest-limit=1 --qf "%{version}-%{release}.%{arch}" kernel-core
+          ' > latest_kernel.txt
+          KERNEL_VER=$(cat latest_kernel.txt | tr -d '[:space:]')
+          echo "latest_kernel=${KERNEL_VER}" >> "$GITHUB_OUTPUT"
+          echo "Latest Fedora 45 kernel: ${KERNEL_VER}"
+
+      - name: Check existing release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          KERNEL_VER="${{ steps.query.outputs.latest_kernel }}"
+          EXISTING_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || echo "")
+          echo "Existing release tag: ${EXISTING_TAG}"
+          if [ "$EXISTING_TAG" = "kmod-${KERNEL_VER}" ] && [ "$FORCE" != "true" ]; then
+            echo "Release for kernel ${KERNEL_VER} already exists. Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build NVIDIA kernel module
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/work" \
+            fedora:45 bash /work/build.sh "${{ steps.query.outputs.latest_kernel }}"
+
+      - name: Publish single latest release
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          KERNEL_VER="${{ steps.query.outputs.latest_kernel }}"
+
+          OLD_RELEASES=$(gh release list --json tagName -q '.[].tagName')
+          for TAG in $OLD_RELEASES; do
+            echo "Deleting old release and tag: ${TAG}"
+            gh release delete "${TAG}" --cleanup-tag -y || true
+          done
+
+          gh release create "kmod-${KERNEL_VER}" \
+            --title "NVIDIA kmod for Kernel ${KERNEL_VER}" \
+            --notes "Pre-compiled NVIDIA kernel module RPM for Fedora 45 (${KERNEL_VER})." \
+            --latest \
+            dist/*.rpm
