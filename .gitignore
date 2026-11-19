@@ -1,0 +1,4 @@
+dist/
+*.rpm
+*.log
+.DS_Store
